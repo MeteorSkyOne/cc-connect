@@ -139,6 +139,7 @@ type Engine struct {
 	agent                 Agent
 	platforms             []Platform
 	sessions              *SessionManager
+	channelTranscript     *ChannelTranscriptStore
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	i18n                  *I18n
@@ -211,8 +212,8 @@ type Engine struct {
 
 	// Terminal observation (--observe)
 	observeEnabled    bool
-	observeProjectDir string             // ~/.claude/projects/{projectKey}
-	observeSessionKey string             // e.g. "slack:C123:U456" — target for forwarding
+	observeProjectDir string // ~/.claude/projects/{projectKey}
+	observeSessionKey string // e.g. "slack:C123:U456" — target for forwarding
 	observeCancel     context.CancelFunc
 
 	// Interactive agent session management
@@ -245,10 +246,12 @@ type queuedMessage struct {
 	content       string
 	images        []ImageAttachment
 	files         []FileAttachment
+	messageID     string
 	fromVoice     bool
 	userID        string
 	msgPlatform   string // platform name for sender injection
 	msgSessionKey string // session key for extracting chat ID
+	channelKey    string // shared channel transcript key
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -373,6 +376,10 @@ func (e *Engine) SetMultiWorkspace(baseDir, bindingStorePath string) {
 	e.workspacePool = newWorkspacePool(15 * time.Minute)
 	e.initFlows = make(map[string]*workspaceInitFlow)
 	go e.runIdleReaper()
+}
+
+func (e *Engine) SetChannelTranscriptStore(store *ChannelTranscriptStore) {
+	e.channelTranscript = store
 }
 
 func (e *Engine) runIdleReaper() {
@@ -1397,7 +1404,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		// Continue processing with the platform-provided text content
 	}
 
-	content := strings.TrimSpace(msg.Content)
+	rawContent := strings.TrimSpace(msg.Content)
+	platformExtraContent := msg.ExtraContent
+	content := rawContent
 	if content == "" && len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Location == nil {
 		return
 	}
@@ -1405,6 +1414,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// Resolve aliases on user text BEFORE merging ExtraContent, so reply
 	// quotes and platform context survive alias resolution (PR #420 fix).
 	content = e.resolveAlias(content)
+	if !strings.HasPrefix(content, "/") {
+		msg.ExtraContent = prependExtraContext(msg.ExtraContent, e.renderChannelTranscript(effectiveWorkspaceChannelKey(msg)))
+	}
 	if msg.ExtraContent != "" {
 		if content == "" {
 			msg.Content = msg.ExtraContent
@@ -1491,6 +1503,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// Permission responses bypass the session lock
 	if e.handlePendingPermission(p, msg, content) {
 		return
+	}
+	if !strings.HasPrefix(content, "/") {
+		e.recordInboundChannelMessage(msg, platformExtraContent, rawContent)
 	}
 
 	// Select session manager and agent based on workspace mode
@@ -1643,10 +1658,12 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		content:       msg.Content,
 		images:        msg.Images,
 		files:         msg.Files,
+		messageID:     msg.MessageID,
 		fromVoice:     msg.FromVoice,
 		userID:        msg.UserID,
 		msgPlatform:   msg.Platform,
 		msgSessionKey: msg.SessionKey,
+		channelKey:    effectiveWorkspaceChannelKey(msg),
 	})
 	queueDepth := len(state.pendingMessages)
 	state.mu.Unlock()
@@ -2062,7 +2079,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		sendDone <- state.agentSession.Send(promptContent, msg.Images, msg.Files)
 	}()
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
+	e.processInteractiveEvents(state, session, sessions, interactiveKey, effectiveWorkspaceChannelKey(msg), msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
@@ -2422,7 +2439,7 @@ func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession Ag
 
 const defaultEventIdleTimeout = 2 * time.Hour
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, channelTranscriptKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
 	var textParts []string
 	var segmentStart int // index into textParts: text before this has been sent/displayed
 	toolCount := 0
@@ -2853,6 +2870,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
 			}
+			e.recordAssistantChannelMessage(channelTranscriptKey, msgID, cleanResponse)
 
 			// TTS: async voice reply if enabled
 			if e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
@@ -3033,6 +3051,7 @@ channelClosed:
 				}
 			}
 		}
+		e.recordAssistantChannelMessage(channelTranscriptKey, msgID, fullResponse)
 	}
 }
 
@@ -3093,7 +3112,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, "", time.Now(), stopTyping, sendDone, queued.replyCtx)
+		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.channelKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx)
 	}
 }
 
@@ -10143,6 +10162,114 @@ func workspaceChannelKey(platformName, channelID string) string {
 
 func extractWorkspaceChannelKey(sessionKey string) string {
 	return workspaceChannelKey(extractPlatformName(sessionKey), extractChannelID(sessionKey))
+}
+
+const recentChannelTranscriptEntries = 8
+const recentChannelTranscriptPromptMax = 400
+
+func (e *Engine) renderChannelTranscript(channelKey string) string {
+	if e.channelTranscript == nil || channelKey == "" {
+		return ""
+	}
+	entries := e.channelTranscript.Recent(channelKey, recentChannelTranscriptEntries)
+	if len(entries) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("[Recent visible messages in this chat]\n")
+	for _, entry := range entries {
+		content := strings.TrimSpace(entry.Content)
+		if content == "" {
+			continue
+		}
+		content = truncateRunesForTranscript(content, recentChannelTranscriptPromptMax)
+		content = strings.ReplaceAll(content, "\r\n", "\n")
+		content = strings.ReplaceAll(content, "\r", "\n")
+		content = strings.ReplaceAll(content, "\n", "\n  ")
+
+		roleLabel := "User"
+		if entry.Role == "assistant" {
+			roleLabel = "Bot"
+		}
+		speaker := strings.TrimSpace(entry.Speaker)
+		if speaker == "" {
+			speaker = roleLabel
+		}
+		sb.WriteString(roleLabel)
+		sb.WriteString(" ")
+		sb.WriteString(speaker)
+		sb.WriteString(": ")
+		sb.WriteString(content)
+		sb.WriteString("\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func prependExtraContext(existing, extra string) string {
+	existing = strings.TrimSpace(existing)
+	extra = strings.TrimSpace(extra)
+	switch {
+	case existing == "":
+		return extra
+	case extra == "":
+		return existing
+	default:
+		return extra + "\n\n" + existing
+	}
+}
+
+func (e *Engine) recordInboundChannelMessage(msg *Message, platformExtra, rawContent string) {
+	if e.channelTranscript == nil {
+		return
+	}
+	channelKey := effectiveWorkspaceChannelKey(msg)
+	if channelKey == "" {
+		return
+	}
+
+	visible := strings.TrimSpace(rawContent)
+	if platformExtra != "" {
+		visible = strings.TrimSpace(strings.TrimSpace(platformExtra) + "\n" + visible)
+	}
+	if visible == "" {
+		return
+	}
+
+	sourceID := ""
+	if msg.MessageID != "" {
+		sourceID = "user:" + msg.Platform + ":" + msg.MessageID
+	}
+	speaker := strings.TrimSpace(msg.UserName)
+	if speaker == "" {
+		speaker = strings.TrimSpace(msg.UserID)
+	}
+	e.channelTranscript.Add(channelKey, ChannelTranscriptEntry{
+		Role:     "user",
+		Speaker:  speaker,
+		Content:  visible,
+		SourceID: sourceID,
+	})
+}
+
+func (e *Engine) recordAssistantChannelMessage(channelKey, msgID, content string) {
+	if e.channelTranscript == nil || channelKey == "" {
+		return
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+	sourceID := ""
+	if msgID != "" {
+		sourceID = "assistant:" + e.name + ":" + msgID
+	}
+	e.channelTranscript.Add(channelKey, ChannelTranscriptEntry{
+		Role:     "assistant",
+		Speaker:  e.name,
+		Content:  content,
+		SourceID: sourceID,
+	})
 }
 
 // effectiveChannelID returns the channel identifier from a Message.
