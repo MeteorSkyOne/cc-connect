@@ -862,7 +862,7 @@ func TestProcessInteractiveEvents_SuppressesDuplicateSideChannelText(t *testing.
 	}
 
 	agentSession.events <- Event{Type: EventResult, Content: sideText, Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m1", time.Now(), nil, nil, nil)
 
 	if got := p.getSent(); len(got) != 1 || got[0] != sideText {
 		t.Fatalf("sent text = %#v, want one side-channel message", got)
@@ -892,7 +892,7 @@ func TestProcessInteractiveEvents_DoesNotSuppressDifferentFinalText(t *testing.T
 
 	finalText := "文件已发出，另外我也把使用方法整理好了。"
 	agentSession.events <- Event{Type: EventResult, Content: finalText, Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m1", time.Now(), nil, nil, nil)
 
 	if got := p.getSent(); len(got) != 2 || got[0] == got[1] {
 		t.Fatalf("sent text = %#v, want side-channel and final reply", got)
@@ -921,7 +921,7 @@ func TestProcessInteractiveEvents_HiddenToolProgressKeepsPreviewOnFinalize(t *te
 	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
 	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m1", time.Now(), nil, nil, nil)
 
 	if got := p.getSent(); len(got) != 0 {
 		t.Fatalf("sent text = %#v, want no plain-text fallback sends", got)
@@ -960,7 +960,7 @@ func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly
 	agentSession.events <- Event{Type: EventText, Content: "done"}
 	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m1", time.Now(), nil, nil, nil)
 
 	sent := p.getSent()
 	if len(sent) < 1 || len(sent) > 2 {
@@ -997,7 +997,7 @@ func TestProcessInteractiveEvents_CompactProgressCoalescesThinkingAndToolUse(t *
 	agentSession.events <- Event{Type: EventText, Content: "done"}
 	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, state.replyCtx)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m1", time.Now(), nil, nil, state.replyCtx)
 
 	sent := p.getSent()
 	if len(sent) != 1 || sent[0] != "done" {
@@ -1042,7 +1042,7 @@ func TestProcessInteractiveEvents_CardProgressUsesCardTemplate(t *testing.T) {
 	agentSession.events <- Event{Type: EventText, Content: "done"}
 	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m2", time.Now(), nil, nil, state.replyCtx)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m2", time.Now(), nil, nil, state.replyCtx)
 
 	sent := p.getSent()
 	if len(sent) != 1 || sent[0] != "done" {
@@ -1101,7 +1101,7 @@ func TestProcessInteractiveEvents_FinalReplyUsesWorkspaceForReferenceRendering(t
 		Done:    true,
 	}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-relative", time.Now(), nil, nil, state.replyCtx)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m-relative", time.Now(), nil, nil, state.replyCtx)
 
 	sent := p.getSent()
 	if len(sent) != 1 {
@@ -1142,7 +1142,7 @@ func TestProcessInteractiveEvents_FinalReplyRemainsRawWhenReferencesDisabled(t *
 		Done:    true,
 	}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-relative-raw", time.Now(), nil, nil, state.replyCtx)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m-relative-raw", time.Now(), nil, nil, state.replyCtx)
 
 	sent := p.getSent()
 	if len(sent) != 1 {
@@ -1175,7 +1175,7 @@ func TestProcessInteractiveEvents_CardProgressUsesStructuredPayloadWhenSupported
 	agentSession.events <- Event{Type: EventText, Content: "done"}
 	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m3", time.Now(), nil, nil, state.replyCtx)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "", "m3", time.Now(), nil, nil, state.replyCtx)
 
 	starts := p.getPreviewStarts()
 	if len(starts) != 1 {
@@ -2217,6 +2217,68 @@ func TestHandleMessage_AutoResetOnIdle_DoesNotTriggerForSlashCommand(t *testing.
 		if strings.Contains(line, "Session auto-reset") {
 			t.Fatalf("unexpected auto-reset notice for slash command: %v", p.getSent())
 		}
+	}
+}
+
+func TestHandleMessage_ChannelTranscriptIncludesOtherBotReplies(t *testing.T) {
+	p := &stubPlatformEngine{n: "discord"}
+	transcript := NewChannelTranscriptStore(filepath.Join(t.TempDir(), "channel_transcripts.json"))
+
+	claudeSession := newResultAgentSession("Today is 2026-04-17 (Friday).")
+	claude := NewEngine("claude", &resultAgent{session: claudeSession}, []Platform{p}, "", LangEnglish)
+	claude.SetChannelTranscriptStore(transcript)
+
+	codexSession := newResultAgentSession("No.")
+	codex := NewEngine("codex", &resultAgent{session: codexSession}, []Platform{p}, "", LangEnglish)
+	codex.SetChannelTranscriptStore(transcript)
+
+	first := &Message{
+		SessionKey: "discord:channel-1:user-1",
+		Platform:   "discord",
+		MessageID:  "msg-1",
+		UserID:     "user-1",
+		UserName:   "MeteorSky",
+		Content:    "what day is it today",
+		ReplyCtx:   "ctx-1",
+	}
+	claude.handleMessage(p, first)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(p.getSent()) == 0 || len(claudeSession.sentPrompts) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for first bot turn, prompts=%#v sent=%#v", claudeSession.sentPrompts, p.getSent())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	second := &Message{
+		SessionKey: "discord:channel-1:user-1",
+		Platform:   "discord",
+		MessageID:  "msg-2",
+		UserID:     "user-1",
+		UserName:   "MeteorSky",
+		Content:    "can u see what claud says",
+		ReplyCtx:   "ctx-2",
+	}
+	codex.handleMessage(p, second)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for len(codexSession.sentPrompts) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for second bot prompt, prompts=%#v", codexSession.sentPrompts)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	prompt := codexSession.sentPrompts[0]
+	if !strings.Contains(prompt, "what day is it today") {
+		t.Fatalf("second bot prompt missing first user message: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Today is 2026-04-17 (Friday).") {
+		t.Fatalf("second bot prompt missing first bot reply: %q", prompt)
+	}
+	if !strings.Contains(prompt, "claude") {
+		t.Fatalf("second bot prompt missing bot speaker label: %q", prompt)
 	}
 }
 
@@ -5522,7 +5584,7 @@ func TestProcessInteractiveEvents_PermissionWhileSendBlocked(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		e.processInteractiveEvents(state, session, e.sessions, key, "m1", time.Now(), nil, sendDone, nil)
+		e.processInteractiveEvents(state, session, e.sessions, key, "", "m1", time.Now(), nil, sendDone, nil)
 		close(done)
 	}()
 
@@ -5802,7 +5864,7 @@ func TestProcessInteractiveEvents_DrainsQueuedMessages(t *testing.T) {
 	// processInteractiveEvents should handle both turns.
 	done := make(chan struct{})
 	go func() {
-		e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), nil, sendDone, nil)
+		e.processInteractiveEvents(state, session, e.sessions, key, "", "msg1", time.Now(), nil, sendDone, nil)
 		close(done)
 	}()
 
@@ -6250,7 +6312,7 @@ func TestAutoCompress_TriggerAfterResult(t *testing.T) {
 	session.AddHistory("user", "hello world")
 
 	// Simulate a full turn.
-	go e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), func() {}, nil, nil)
+	go e.processInteractiveEvents(state, session, e.sessions, key, "", "msg1", time.Now(), func() {}, nil, nil)
 
 	sess.events <- Event{Type: EventResult, Content: "response", Done: true}
 
@@ -6670,7 +6732,7 @@ func TestCmdStop_ReturnsWhileCloseBlockedAndStopsEventLoop(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		e.processInteractiveEvents(state, session, e.sessions, key, "msg-1", time.Now(), nil, nil, "ctx")
+		e.processInteractiveEvents(state, session, e.sessions, key, "", "msg-1", time.Now(), nil, nil, "ctx")
 		close(done)
 	}()
 
@@ -6923,7 +6985,7 @@ func TestEventIdleTimeout_CleansUpSession(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		e.processInteractiveEvents(state, session, e.sessions, key, "", time.Now(), nil, nil, nil)
+		e.processInteractiveEvents(state, session, e.sessions, key, "", "", time.Now(), nil, nil, nil)
 		close(done)
 	}()
 
@@ -6967,7 +7029,7 @@ func TestEventIdleTimeout_ResetOnEvent(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		e.processInteractiveEvents(state, session, e.sessions, key, "", time.Now(), nil, nil, nil)
+		e.processInteractiveEvents(state, session, e.sessions, key, "", "", time.Now(), nil, nil, nil)
 		close(done)
 	}()
 
@@ -7019,7 +7081,7 @@ func TestEventIdleTimeout_DisabledWhenZero(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		e.processInteractiveEvents(state, session, e.sessions, key, "", time.Now(), nil, nil, nil)
+		e.processInteractiveEvents(state, session, e.sessions, key, "", "", time.Now(), nil, nil, nil)
 		close(done)
 	}()
 

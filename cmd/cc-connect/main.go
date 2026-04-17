@@ -176,6 +176,10 @@ func main() {
 
 	engines := make([]*core.Engine, 0, len(cfg.Projects))
 	effectiveWorkDirs := make([]string, 0, len(cfg.Projects))
+	var channelTranscript *core.ChannelTranscriptStore
+	if cfg.DataDir != "" {
+		channelTranscript = core.NewChannelTranscriptStore(filepath.Join(cfg.DataDir, "channel_transcripts.json"))
+	}
 
 	for _, proj := range cfg.Projects {
 		// Inject project-level run_as_user / run_as_env into the agent's
@@ -238,6 +242,7 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+		engine.SetChannelTranscriptStore(channelTranscript)
 		showCtx := true
 		if proj.ShowContextIndicator != nil {
 			showCtx = *proj.ShowContextIndicator
