@@ -231,7 +231,15 @@ type compactProgressWriter struct {
 	// Throttle message edits to avoid platform rate limits (e.g. Discord ~5 edits/5s).
 	minUpdateInterval time.Duration
 	lastUpdateAt      time.Time
+
+	// Transient edit failures (network blips, Discord 503s) should not
+	// permanently kill the card. We retry by letting the next
+	// AppendStructured call re-send the full buffered state, and only mark
+	// the writer as failed after this many consecutive UpdateMessage errors.
+	consecutiveEditFailures int
 }
+
+const maxConsecutiveProgressEditFailures = 3
 
 func normalizeProgressStyle(style string) string {
 	switch strings.ToLower(strings.TrimSpace(style)) {
@@ -485,10 +493,20 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	err := w.updater.UpdateMessage(callCtx, w.handle, w.content)
 	cancel()
 	if err != nil {
-		slog.Warn("progress writer: UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
-		w.failed = true
-		return false
+		w.consecutiveEditFailures++
+		slog.Warn("progress writer: UpdateMessage failed",
+			"platform", w.platform.Name(), "style", w.style,
+			"consecutive_failures", w.consecutiveEditFailures, "error", err)
+		if w.consecutiveEditFailures >= maxConsecutiveProgressEditFailures {
+			w.failed = true
+			return false
+		}
+		// Transient failure: item is already buffered in w.items. Leave
+		// lastSent unchanged so the next AppendStructured retries with
+		// the full state and the card self-heals when the API recovers.
+		return true
 	}
+	w.consecutiveEditFailures = 0
 	w.lastSent = w.content
 	w.lastUpdateAt = time.Now()
 	return true

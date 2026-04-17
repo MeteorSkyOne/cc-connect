@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -278,6 +279,117 @@ func TestCompactProgressWriter_ThrottlesRapidUpdates(t *testing.T) {
 	}
 	if len(payload.Items) != 4 {
 		t.Fatalf("items = %d, want 4 (all buffered items)", len(payload.Items))
+	}
+}
+
+type stubFlakyProgressPlatform struct {
+	stubCompactProgressPlatform
+	editErrs []error // consumed in order; nil means success
+	editIdx  int
+}
+
+func (p *stubFlakyProgressPlatform) UpdateMessage(ctx context.Context, handle any, content string) error {
+	var err error
+	if p.editIdx < len(p.editErrs) {
+		err = p.editErrs[p.editIdx]
+	}
+	p.editIdx++
+	if err != nil {
+		return err
+	}
+	return p.stubCompactProgressPlatform.UpdateMessage(ctx, handle, content)
+}
+
+func TestCompactProgressWriter_RecoversFromTransientEditError(t *testing.T) {
+	p := &stubFlakyProgressPlatform{
+		stubCompactProgressPlatform: stubCompactProgressPlatform{
+			stubPlatformEngine: stubPlatformEngine{n: "discord"},
+			style:              "card",
+			supportPayload:     true,
+		},
+		editErrs: []error{errors.New("discord 503 service unavailable")},
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "cc", LangEnglish, nil)
+
+	if !w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Bash", Text: "pwd"}, "pwd") {
+		t.Fatal("first append should create the preview")
+	}
+	if len(p.getPreviewStarts()) != 1 {
+		t.Fatalf("preview starts = %d, want 1", len(p.getPreviewStarts()))
+	}
+
+	// Second append triggers the (flaky) UpdateMessage → returns error.
+	// A single transient failure must NOT permanently disable the card.
+	if !w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Read", Text: "foo.go"}, "Read foo.go") {
+		t.Fatal("single transient edit error should not disable the card")
+	}
+	if w.failed {
+		t.Fatal("card should not be marked failed after one transient error")
+	}
+
+	// Third append: UpdateMessage succeeds this time, card should now include
+	// both the failed item and the new one.
+	if !w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Edit", Text: "foo.go"}, "Edit foo.go") {
+		t.Fatal("third append should succeed after API recovers")
+	}
+
+	edits := p.getPreviewEdits()
+	if len(edits) == 0 {
+		t.Fatal("expected at least one successful edit after recovery")
+	}
+	last := edits[len(edits)-1]
+	payload, ok := ParseProgressCardPayload(last)
+	if !ok {
+		t.Fatalf("last edit should be a valid payload, got %q", last)
+	}
+	if n := len(payload.Items); n != 3 {
+		t.Fatalf("card items after recovery = %d, want 3 (all buffered)", n)
+	}
+}
+
+func TestCompactProgressWriter_GivesUpAfterPersistentEditErrors(t *testing.T) {
+	p := &stubFlakyProgressPlatform{
+		stubCompactProgressPlatform: stubCompactProgressPlatform{
+			stubPlatformEngine: stubPlatformEngine{n: "discord"},
+			style:              "card",
+			supportPayload:     true,
+		},
+		editErrs: []error{
+			errors.New("503 #1"),
+			errors.New("503 #2"),
+			errors.New("503 #3"),
+			errors.New("503 #4"),
+		},
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "cc", LangEnglish, nil)
+
+	if !w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Bash", Text: "a"}, "a") {
+		t.Fatal("first append should create the preview")
+	}
+	// Drain up to maxConsecutiveProgressEditFailures failures. Each should
+	// return true while the writer is still optimistic.
+	for i := 0; i < maxConsecutiveProgressEditFailures; i++ {
+		ok := w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "X", Text: "x"}, "x")
+		isLast := i == maxConsecutiveProgressEditFailures-1
+		if isLast {
+			if ok {
+				t.Fatalf("append #%d (threshold) should return false after giving up", i+1)
+			}
+			if !w.failed {
+				t.Fatal("writer should be marked failed after threshold reached")
+			}
+		} else {
+			if !ok {
+				t.Fatalf("append #%d should still be optimistic", i+1)
+			}
+			if w.failed {
+				t.Fatalf("writer should not yet be failed at append #%d", i+1)
+			}
+		}
+	}
+	// Any further appends must fall through to the text-message fallback.
+	if w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Y", Text: "y"}, "y") {
+		t.Fatal("append after failure should return false")
 	}
 }
 
