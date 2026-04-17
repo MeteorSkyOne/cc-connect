@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -187,6 +188,112 @@ func TestClaudeSessionSetLiveMode(t *testing.T) {
 	cs.SetLiveMode("bypassPermissions")
 	if !cs.autoApprove.Load() || cs.acceptEditsOnly.Load() || cs.dontAsk.Load() {
 		t.Fatal("bypassPermissions alias flags not set correctly")
+	}
+}
+
+func TestHandleControlRequest_YOLOBypassesAskUserQuestion(t *testing.T) {
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: context.Background()}
+	cs.setPermissionMode("bypassPermissions")
+	if !cs.autoApprove.Load() {
+		t.Fatal("autoApprove should be true under bypassPermissions")
+	}
+
+	raw := map[string]any{
+		"request_id": "req-1",
+		"request": map[string]any{
+			"subtype":   "can_use_tool",
+			"tool_name": "AskUserQuestion",
+			"input": map[string]any{
+				"questions": []any{
+					map[string]any{
+						"question":    "Pick one?",
+						"header":      "Pick",
+						"multiSelect": false,
+						"options": []any{
+							map[string]any{"label": "A", "description": "first"},
+							map[string]any{"label": "B", "description": "second"},
+						},
+					},
+				},
+			},
+		},
+	}
+	cs.handleControlRequest(raw)
+
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventPermissionRequest {
+			t.Fatalf("event type = %v, want EventPermissionRequest", evt.Type)
+		}
+		if evt.ToolName != "AskUserQuestion" {
+			t.Fatalf("tool name = %q, want AskUserQuestion", evt.ToolName)
+		}
+		if len(evt.Questions) != 1 {
+			t.Fatalf("questions = %d, want 1", len(evt.Questions))
+		}
+		if evt.Questions[0].Question != "Pick one?" {
+			t.Fatalf("question text = %q", evt.Questions[0].Question)
+		}
+	default:
+		t.Fatal("expected EventPermissionRequest to be emitted, but events channel was empty (tool was auto-approved instead)")
+	}
+}
+
+func TestHandleControlRequest_YOLOStillAutoApprovesOtherTools(t *testing.T) {
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: context.Background()}
+	cs.setPermissionMode("bypassPermissions")
+	// alive=false so RespondPermission returns error instead of writing to a
+	// nil stdin. We only care that no event is emitted.
+	cs.alive.Store(false)
+
+	raw := map[string]any{
+		"request_id": "req-2",
+		"request": map[string]any{
+			"subtype":   "can_use_tool",
+			"tool_name": "Bash",
+			"input":     map[string]any{"command": "ls"},
+		},
+	}
+	cs.handleControlRequest(raw)
+
+	select {
+	case evt := <-cs.events:
+		t.Fatalf("unexpected event emitted under YOLO for Bash: %+v", evt)
+	default:
+	}
+}
+
+func TestHandleControlRequest_DontAskBypassesAskUserQuestion(t *testing.T) {
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: context.Background()}
+	cs.setPermissionMode("dontAsk")
+	if !cs.dontAsk.Load() {
+		t.Fatal("dontAsk should be true")
+	}
+
+	raw := map[string]any{
+		"request_id": "req-3",
+		"request": map[string]any{
+			"subtype":   "can_use_tool",
+			"tool_name": "AskUserQuestion",
+			"input": map[string]any{
+				"questions": []any{
+					map[string]any{"question": "?", "header": "h", "multiSelect": false, "options": []any{
+						map[string]any{"label": "a", "description": "d"},
+						map[string]any{"label": "b", "description": "d"},
+					}},
+				},
+			},
+		},
+	}
+	cs.handleControlRequest(raw)
+
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventPermissionRequest || evt.ToolName != "AskUserQuestion" {
+			t.Fatalf("unexpected event: %+v", evt)
+		}
+	default:
+		t.Fatal("expected AskUserQuestion event under dontAsk mode, got none")
 	}
 }
 

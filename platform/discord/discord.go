@@ -726,12 +726,24 @@ func reconstructCommand(data discordgo.ApplicationCommandInteractionData) string
 
 func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, userID, userName string) {
 	data := i.MessageComponentData()
-	if !strings.HasPrefix(data.CustomID, "cmd:") {
+
+	var dispatchContent, confirmSuffix string
+	switch {
+	case strings.HasPrefix(data.CustomID, "cmd:"):
+		command := strings.TrimPrefix(data.CustomID, "cmd:")
+		dispatchContent = command
+		confirmSuffix = command
+	case strings.HasPrefix(data.CustomID, "askq:"):
+		dispatchContent = data.CustomID
+		confirmSuffix = findButtonLabel(i.Message, data.CustomID)
+		if confirmSuffix == "" {
+			confirmSuffix = data.CustomID
+		}
+	default:
 		slog.Debug("discord: unknown component interaction", "custom_id", data.CustomID)
 		return
 	}
 
-	command := strings.TrimPrefix(data.CustomID, "cmd:")
 	origText := ""
 	if i.Message != nil {
 		origText = i.Message.Content
@@ -740,11 +752,11 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{
-			Content:    origText + "\n\n> " + command,
+			Content:    origText + "\n\n> " + confirmSuffix,
 			Components: emptyComponents,
 		},
 	}); err != nil {
-		slog.Debug("discord: command component update failed", "error", err)
+		slog.Debug("discord: component update failed", "error", err)
 	}
 
 	channelID := i.ChannelID
@@ -760,9 +772,29 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 		UserID:     userID,
 		UserName:   userName,
 		ChatName:   p.resolveChannelName(channelID),
-		Content:    command,
+		Content:    dispatchContent,
 		ReplyCtx:   rc,
 	})
+}
+
+// findButtonLabel searches a message's component tree for a button with the
+// given CustomID and returns its label. Returns "" if not found.
+func findButtonLabel(msg *discordgo.Message, customID string) string {
+	if msg == nil {
+		return ""
+	}
+	for _, row := range msg.Components {
+		ar, ok := row.(*discordgo.ActionsRow)
+		if !ok {
+			continue
+		}
+		for _, c := range ar.Components {
+			if btn, ok := c.(*discordgo.Button); ok && btn.CustomID == customID {
+				return btn.Label
+			}
+		}
+	}
+	return ""
 }
 
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
@@ -962,6 +994,17 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 	}
 }
 
+// Discord's API rejects button labels longer than 80 characters.
+const maxDiscordButtonLabel = 80
+
+func truncateButtonLabel(s string) string {
+	runes := []rune(s)
+	if len(runes) <= maxDiscordButtonLabel {
+		return s
+	}
+	return string(runes[:maxDiscordButtonLabel-1]) + "…"
+}
+
 func buildDiscordActionRows(rows [][]core.ButtonOption) []discordgo.MessageComponent {
 	components := make([]discordgo.MessageComponent, 0, len(rows))
 	for _, row := range rows {
@@ -980,7 +1023,7 @@ func buildDiscordActionRows(rows [][]core.ButtonOption) []discordgo.MessageCompo
 				style = discordgo.PrimaryButton
 			}
 			buttons = append(buttons, discordgo.Button{
-				Label:    btn.Text,
+				Label:    truncateButtonLabel(btn.Text),
 				Style:    style,
 				CustomID: btn.Data,
 			})
@@ -991,10 +1034,6 @@ func buildDiscordActionRows(rows [][]core.ButtonOption) []discordgo.MessageCompo
 }
 
 func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string, buttons [][]core.ButtonOption) error {
-	rc, ok := rctx.(*interactionReplyCtx)
-	if !ok {
-		return core.ErrNotSupported
-	}
 	if len(buttons) == 0 {
 		return fmt.Errorf("discord: no buttons provided")
 	}
@@ -1002,17 +1041,35 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 	if len(components) == 0 {
 		return fmt.Errorf("discord: no buttons provided")
 	}
-	if err := p.sendInteraction(rc, content); err != nil {
-		return err
+	switch rc := rctx.(type) {
+	case *interactionReplyCtx:
+		if err := p.sendInteraction(rc, content); err != nil {
+			return err
+		}
+		_, err := p.session.FollowupMessageCreate(rc.interaction, true, &discordgo.WebhookParams{
+			Content:    content,
+			Components: components,
+		})
+		if err != nil {
+			return fmt.Errorf("discord: send button followup: %w", err)
+		}
+		return nil
+	case replyContext:
+		send := &discordgo.MessageSend{
+			Content:    content,
+			Components: components,
+		}
+		if !rc.useThreadChannel() && rc.messageID != "" {
+			send.Reference = &discordgo.MessageReference{MessageID: rc.messageID}
+		}
+		_, err := p.session.ChannelMessageSendComplex(rc.targetChannelID(), send)
+		if err != nil {
+			return fmt.Errorf("discord: send button message: %w", err)
+		}
+		return nil
+	default:
+		return core.ErrNotSupported
 	}
-	_, err := p.session.FollowupMessageCreate(rc.interaction, true, &discordgo.WebhookParams{
-		Content:    content,
-		Components: components,
-	})
-	if err != nil {
-		return fmt.Errorf("discord: send button followup: %w", err)
-	}
-	return nil
 }
 
 func (p *progressPlatform) ProgressUpdateInterval() time.Duration {

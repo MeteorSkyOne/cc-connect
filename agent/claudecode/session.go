@@ -371,7 +371,12 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 	toolName, _ := request["tool_name"].(string)
 	input, _ := request["input"].(map[string]any)
 
-	if cs.autoApprove.Load() {
+	// AskUserQuestion needs the user's actual answers populated into
+	// UpdatedInput; auto-approving with the original (answerless) input turns
+	// the tool into a no-op. Always route it through the platform.
+	isAskQuestion := toolName == "AskUserQuestion"
+
+	if cs.autoApprove.Load() && !isAskQuestion {
 		slog.Debug("claudeSession: auto-approving", "request_id", requestID, "tool", toolName)
 		_ = cs.RespondPermission(requestID, core.PermissionResult{
 			Behavior:     "allow",
@@ -379,7 +384,7 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 		})
 		return
 	}
-	if cs.dontAsk.Load() {
+	if cs.dontAsk.Load() && !isAskQuestion {
 		slog.Debug("claudeSession: auto-denying", "request_id", requestID, "tool", toolName)
 		_ = cs.RespondPermission(requestID, core.PermissionResult{
 			Behavior: "deny",

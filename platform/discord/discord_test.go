@@ -417,6 +417,96 @@ func TestSendWithButtons_PreservesMultipleRows(t *testing.T) {
 	}
 }
 
+func TestSendWithButtons_ChannelReplyContext(t *testing.T) {
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg-askq","channel_id":"ch-1"}`)
+	}))
+	defer server.Close()
+
+	s := newTestDiscordSession(t, server)
+	p := &Platform{session: s}
+
+	rc := replyContext{channelID: "ch-1", messageID: "orig-msg"}
+	err := p.SendWithButtons(context.Background(), rc, "Pick one", [][]core.ButtonOption{
+		{{Text: "Yes", Data: "askq:0:1"}},
+		{{Text: "No", Data: "askq:0:2"}},
+	})
+	if err != nil {
+		t.Fatalf("SendWithButtons() error = %v", err)
+	}
+
+	if gotPayload["content"] != "Pick one" {
+		t.Fatalf("content = %#v, want Pick one", gotPayload["content"])
+	}
+	components, ok := gotPayload["components"].([]any)
+	if !ok || len(components) != 2 {
+		t.Fatalf("components = %#v, want two rows", gotPayload["components"])
+	}
+	firstBtn := components[0].(map[string]any)["components"].([]any)[0].(map[string]any)
+	if firstBtn["custom_id"] != "askq:0:1" {
+		t.Fatalf("first button custom_id = %#v, want askq:0:1", firstBtn["custom_id"])
+	}
+	ref, ok := gotPayload["message_reference"].(map[string]any)
+	if !ok {
+		t.Fatalf("message_reference missing in payload %#v", gotPayload)
+	}
+	if ref["message_id"] != "orig-msg" {
+		t.Fatalf("message_reference.message_id = %#v, want orig-msg", ref["message_id"])
+	}
+}
+
+func TestSendWithButtons_RejectsUnknownContext(t *testing.T) {
+	p := &Platform{}
+	err := p.SendWithButtons(context.Background(), "not-a-context", "x", [][]core.ButtonOption{{{Text: "A", Data: "askq:0:1"}}})
+	if err != core.ErrNotSupported {
+		t.Fatalf("err = %v, want ErrNotSupported", err)
+	}
+}
+
+func TestBuildDiscordActionRows_TruncatesLongLabels(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	components := buildDiscordActionRows([][]core.ButtonOption{{{Text: long, Data: "askq:0:1"}}})
+	if len(components) != 1 {
+		t.Fatalf("components len = %d, want 1", len(components))
+	}
+	row := components[0].(discordgo.ActionsRow)
+	btn := row.Components[0].(discordgo.Button)
+	if n := len([]rune(btn.Label)); n > maxDiscordButtonLabel {
+		t.Fatalf("label rune count = %d, want <= %d", n, maxDiscordButtonLabel)
+	}
+	if !strings.HasSuffix(btn.Label, "…") {
+		t.Fatalf("label = %q, want ellipsis suffix", btn.Label)
+	}
+	if btn.CustomID != "askq:0:1" {
+		t.Fatalf("custom_id = %q, want askq:0:1", btn.CustomID)
+	}
+}
+
+func TestFindButtonLabel(t *testing.T) {
+	msg := &discordgo.Message{
+		Components: []discordgo.MessageComponent{
+			&discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+				&discordgo.Button{Label: "Yes", CustomID: "askq:0:1"},
+				&discordgo.Button{Label: "No", CustomID: "askq:0:2"},
+			}},
+		},
+	}
+	if got := findButtonLabel(msg, "askq:0:2"); got != "No" {
+		t.Fatalf("findButtonLabel = %q, want No", got)
+	}
+	if got := findButtonLabel(msg, "askq:9:9"); got != "" {
+		t.Fatalf("findButtonLabel(missing) = %q, want empty", got)
+	}
+	if got := findButtonLabel(nil, "askq:0:1"); got != "" {
+		t.Fatalf("findButtonLabel(nil) = %q, want empty", got)
+	}
+}
+
 func TestSendFile_SendsChannelAttachment(t *testing.T) {
 	var contentType string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
