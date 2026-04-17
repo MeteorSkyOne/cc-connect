@@ -206,6 +206,30 @@ Available tags: `no_acp`, `no_claudecode`, `no_codex`, `no_cursor`, `no_gemini`,
 `no_discord`, `no_slack`, `no_dingtalk`, `no_wecom`, `no_weixin`, `no_qq`, `no_qqbot`,
 `no_line`.
 
+## Restarting cc-connect Safely
+
+When cc-connect is running in a tmux session and the AI agent (Claude
+Code / Codex / etc.) is connected through it, a naive restart would
+kill the agent's own shell before it can bring cc-connect back up. The
+helper script `~/.local/bin/cc-connect-restart` handles this by
+re-execing itself under `setsid nohup` so the relaunch survives its
+parent dying.
+
+What it does:
+
+1. Verifies the tmux session exists (default: `cc-connect`).
+2. Re-execs detached, returns a scheduled-pid line, and exits.
+3. Sends `Ctrl-C` to the pane, waits up to 15s for graceful exit,
+   then escalates to `SIGTERM` / `SIGKILL` if needed.
+4. Types `cd $CC_CONNECT_CWD && $CC_CONNECT_START_CMD` + Enter into
+   the pane. Defaults: cwd = this repo, start cmd = `./cc-connect`.
+
+Env overrides: `CC_CONNECT_TMUX_SESSION`, `CC_CONNECT_CWD`,
+`CC_CONNECT_START_CMD`. All steps log to `/tmp/cc-connect-restart.log`.
+
+Use this — never call `tmux send-keys ... C-c` synchronously from an
+agent shell, since that would orphan the restart mid-way.
+
 ## Pre-Commit Checklist
 
 1. **Build passes**: `go build ./...`
