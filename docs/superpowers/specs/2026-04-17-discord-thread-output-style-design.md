@@ -99,12 +99,7 @@ In-memory only (not persisted): the last-rendered-index cursor for the append-on
 
 **Not-found recovery.** On Discord error 10003 (Unknown Channel — thread deleted) or 10008 (Unknown Message — summary message deleted), clear the relevant persisted entry and recreate on the next event. Logged at warn.
 
-**First-prompt plumbing.** The engine already knows the session's latest user message when it invokes progress rendering. To derive the thread name we need the *first* user message of the session. Options:
-
-- Preferred: extend `SendPreviewStart`'s context (via a new optional field or a new capability interface) to carry the session's first user prompt string.
-- Alternative: platform looks it up from its own recorded state (it already sees every inbound message). Slightly messier but keeps core unchanged.
-
-Final choice deferred to implementation plan; both are small. The spec does not prescribe.
+**First-prompt plumbing.** To derive the thread name we need the session's *first* user message. The Discord platform already receives every inbound user message before the engine dispatches it, so the platform records the first message per session key itself — no core change required. Stored in the same generic `PlatformState` map under `"<sessionKey>:first_prompt"`, persisted alongside the thread ID so the name can be re-derived even if thread creation is retried after a restart. The record is set once per session and never overwritten.
 
 ### Rendering
 
@@ -126,7 +121,7 @@ Final choice deferred to implementation plan; both are small. The spec does not 
 
 **Final AI answer.** Unchanged. Goes to the original reply context (`#general`) via the existing `Reply()` path. Thread routing affects only the progress-card flow.
 
-**Rate-limit posture.** Append sends piggy-back on the same 2s-throttled progress goroutine. Entries arriving within a single tick are sent in a single loop (respects Discord's per-channel rate limits naturally). No extra backoff logic in v1.
+**Rate-limit posture.** Append sends piggy-back on the same 2s-throttled progress goroutine. Within a single tick, at most `N_APPEND = 5` new entries are posted as individual embeds; any excess is folded into a single "… and K more events" consolidation embed posted at the end of the tick, and the consolidated entries are still tracked so they'll flush on subsequent ticks. Prevents a single tick from firing a dozen writes at Discord's per-channel rate limit.
 
 **`SendPreviewStart` / `UpdateMessage` / `DeletePreviewMessage` mapping.**
 
@@ -141,7 +136,7 @@ Final choice deferred to implementation plan; both are small. The spec does not 
 | DM context (no threads possible) | Silently fall back to `card` style for that session. Debug log. |
 | Bot lacks Create Public Threads / Send Messages in Threads perms | Fall back to `card` for that session. Warn log naming the missing permission. |
 | `log_thread_channel` not visible / doesn't exist | Same fallback as missing perms. Warn. |
-| Thread archived between turns | Discord auto-unarchives on next message. No special handling. |
+| Thread archived between turns | Before posting, call `ChannelEditComplex(threadID, {Archived: false})` to un-archive. Archived threads are read-only, so this explicit step is required. |
 | Thread locked | Treat as "thread gone" — clear state and recreate. |
 | Thread manually deleted (10003) / summary msg deleted (10008) | Clear persisted entry and recreate on next event. Warn. |
 | `thread_isolation = true` combined with thread style | Orthogonal. `thread_isolation` determines session keying; `progress_style = "thread"` determines log location. Both apply independently. |
@@ -187,6 +182,5 @@ Final choice deferred to implementation plan; both are small. The spec does not 
 
 ## Risks & Open Questions
 
-- **First-prompt plumbing choice** (core addition vs. platform-local recording) deferred to the implementation plan. Both are small; pick whichever yields the cleanest diff.
-- **Rate limits** under extreme tool-call bursts: the 2s throttle mitigates this, but a session emitting hundreds of events per minute could still hit per-channel limits. If observed in practice, follow up with batching multiple events into a single embed. Out of scope for v1.
+- **Rate limits under burst.** The 2s throttle alone is insufficient if a tick surfaces many new entries. Concrete rule: per tick, at most `N_APPEND = 5` append messages are posted; any excess entries are folded into a single consolidated "… and K more events" embed that is then flushed on the next tick. Prevents a single tick from firing dozens of writes at Discord's per-channel limit.
 - **Thread name quality** for sessions whose first prompt is empty or very short (e.g., "hi"). Falls back to something like `session-<shortkey>` — decided in implementation, not here.
