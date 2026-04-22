@@ -53,6 +53,8 @@ type Platform struct {
 	shareSessionInChannel      bool
 	threadIsolation            bool
 	respondToAtEveryoneAndHere bool
+	tableAlign                 bool
+	tableImage                 bool
 	proxyURL                   *url.URL
 	session                    *discordgo.Session
 	handler                    core.MessageHandler
@@ -78,6 +80,8 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
+	tableAlign, _ := opts["table_align"].(bool)
+	tableImage, _ := opts["table_image"].(bool)
 	progressStyle := "legacy"
 	if v, ok := opts["progress_style"].(string); ok {
 		switch strings.ToLower(strings.TrimSpace(v)) {
@@ -113,6 +117,8 @@ func New(opts map[string]any) (core.Platform, error) {
 		readyCh:                    make(chan struct{}),
 		threadIsolation:            threadIsolation,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
+		tableAlign:                 tableAlign,
+		tableImage:                 tableImage,
 		proxyURL:                   proxyU,
 	}
 	if progressStyle == "compact" || progressStyle == "card" {
@@ -824,28 +830,45 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 // mechanism. The first call edits the deferred "thinking" response; subsequent
 // calls create followup messages.
 func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) error {
-	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
-	for _, chunk := range chunks {
-		ictx.mu.Lock()
-		first := !ictx.firstDone
-		if first {
-			ictx.firstDone = true
-		}
-		ictx.mu.Unlock()
+	segments := p.prepareContent(content)
+	for _, seg := range segments {
+		files := p.renderFiles(seg)
+		chunks := core.SplitMessageCodeFenceAware(seg.text, maxDiscordLen)
+		for i, chunk := range chunks {
+			ictx.mu.Lock()
+			first := !ictx.firstDone
+			if first {
+				ictx.firstDone = true
+			}
+			ictx.mu.Unlock()
 
-		var err error
-		if first {
-			c := chunk
-			_, err = p.session.InteractionResponseEdit(ictx.interaction, &discordgo.WebhookEdit{Content: &c})
-		} else {
-			_, err = p.session.FollowupMessageCreate(ictx.interaction, true, &discordgo.WebhookParams{Content: chunk})
-		}
+			isLast := i == len(chunks)-1
+			var err error
+			if first {
+				c := chunk
+				edit := &discordgo.WebhookEdit{Content: &c}
+				if isLast {
+					edit.Files = files
+				}
+				_, err = p.session.InteractionResponseEdit(ictx.interaction, edit)
+			} else {
+				params := &discordgo.WebhookParams{Content: chunk}
+				if isLast {
+					params.Files = files
+				}
+				_, err = p.session.FollowupMessageCreate(ictx.interaction, true, params)
+			}
 
-		if err != nil {
-			slog.Warn("discord: interaction response failed, falling back to channel message", "error", err)
-			_, err = p.session.ChannelMessageSend(ictx.channelID, chunk)
 			if err != nil {
-				return fmt.Errorf("discord: send fallback: %w", err)
+				slog.Warn("discord: interaction response failed, falling back to channel message", "error", err)
+				msg := &discordgo.MessageSend{Content: chunk}
+				if isLast {
+					msg.Files = files
+				}
+				_, err = p.session.ChannelMessageSendComplex(ictx.channelID, msg)
+				if err != nil {
+					return fmt.Errorf("discord: send fallback: %w", err)
+				}
 			}
 		}
 	}
@@ -853,31 +876,69 @@ func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) er
 }
 
 func (p *Platform) sendChannelReply(rc replyContext, content string) error {
-	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
-	for _, chunk := range chunks {
-		var err error
-		if rc.useThreadChannel() || rc.messageID == "" {
-			_, err = p.session.ChannelMessageSend(rc.targetChannelID(), chunk)
-		} else {
-			ref := &discordgo.MessageReference{MessageID: rc.messageID}
-			_, err = p.session.ChannelMessageSendReply(rc.channelID, chunk, ref)
-		}
-		if err != nil {
-			return fmt.Errorf("discord: send: %w", err)
+	segments := p.prepareContent(content)
+	firstMsg := true
+	for _, seg := range segments {
+		files := p.renderFiles(seg)
+		chunks := core.SplitMessageCodeFenceAware(seg.text, maxDiscordLen)
+		for i, chunk := range chunks {
+			msg := &discordgo.MessageSend{Content: chunk}
+			if i == len(chunks)-1 {
+				msg.Files = files
+			}
+			if firstMsg && !rc.useThreadChannel() && rc.messageID != "" {
+				msg.Reference = &discordgo.MessageReference{MessageID: rc.messageID}
+			}
+			firstMsg = false
+			_, err := p.session.ChannelMessageSendComplex(rc.targetChannelID(), msg)
+			if err != nil {
+				return fmt.Errorf("discord: send: %w", err)
+			}
 		}
 	}
 	return nil
 }
 
 func (p *Platform) sendChannel(rc replyContext, content string) error {
-	chunks := core.SplitMessageCodeFenceAware(wrapTablesInCodeBlocks(content), maxDiscordLen)
-	for _, chunk := range chunks {
-		_, err := p.session.ChannelMessageSend(rc.targetChannelID(), chunk)
-		if err != nil {
-			return fmt.Errorf("discord: send: %w", err)
+	segments := p.prepareContent(content)
+	for _, seg := range segments {
+		files := p.renderFiles(seg)
+		chunks := core.SplitMessageCodeFenceAware(seg.text, maxDiscordLen)
+		for i, chunk := range chunks {
+			msg := &discordgo.MessageSend{Content: chunk}
+			if i == len(chunks)-1 {
+				msg.Files = files
+			}
+			_, err := p.session.ChannelMessageSendComplex(rc.targetChannelID(), msg)
+			if err != nil {
+				return fmt.Errorf("discord: send: %w", err)
+			}
 		}
 	}
 	return nil
+}
+
+func (p *Platform) prepareContent(content string) []contentSegment {
+	if p.tableAlign {
+		return splitContentAroundTables(content)
+	}
+	return []contentSegment{{text: content}}
+}
+
+func (p *Platform) renderFiles(seg contentSegment) []*discordgo.File {
+	if !p.tableImage || seg.table == nil {
+		return nil
+	}
+	imgData, err := renderTablePNG(*seg.table)
+	if err != nil {
+		slog.Warn("discord: render table image", "error", err)
+		return nil
+	}
+	return []*discordgo.File{{
+		Name:        "table.png",
+		ContentType: "image/png",
+		Reader:      bytes.NewReader(imgData),
+	}}
 }
 
 // SendImage sends an image to the channel or interaction.

@@ -860,6 +860,8 @@ app_secret = "your-feishu-app-secret"
 #                            # card = one editable Discord embed progress card / card = 单条可编辑的 Discord 嵌入式进度卡
 # respond_to_at_everyone_and_here = false  # If true, treat @everyone/@here as a direct mention so the bot responds
 #                              # 设为 true 时，将 @everyone/@here 视为直接 @ 机器人，使机器人响应
+# table_align = false  # If true, auto-align markdown tables in monospace code blocks / 自动对齐 markdown 表格
+# table_image = false  # If true, render tables as PNG images attached to the message / 以图片形式附加表格
 # proxy = "http://127.0.0.1:7890"  # Optional HTTP/SOCKS5 proxy for Discord API & Gateway / 可选代理
 # proxy_username = ""              # Optional proxy auth username / 代理用户名
 # proxy_password = ""              # Optional proxy auth password / 代理密码
